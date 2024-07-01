@@ -15,9 +15,9 @@ from .planner import Planner
 from .api_selector import APISelector
 from .caller import Caller
 from utils import ReducedOpenAPISpec
+from services.huggingface_service import HuggingFaceService
 
 logger = logging.getLogger(__name__)
-
 
 class ApiLLM(Chain):
     """Consists of an agent using tools."""
@@ -33,6 +33,7 @@ class ApiLLM(Chain):
     max_iterations: Optional[int] = 15
     max_execution_time: Optional[float] = None
     early_stopping_method: str = "force"
+    huggingface_service: HuggingFaceService = HuggingFaceService()
 
     def __init__(
             self,
@@ -127,45 +128,47 @@ class ApiLLM(Chain):
             return True
         return False
 
-    def _call(
+    async def _call(
             self,
             inputs: Dict[str, Any],
             run_manager: Optional[CallbackManagerForChainRun] = None,
     ) -> Dict[str, Any]:
         query = inputs['query']
 
-        planner_history: List[Tuple[str, str]] = []
-        iterations = 0
-        time_elapsed = 0.0
-        start_time = time.time()
-
-        plan = self.planner.run(input=query, history=planner_history)
-        logger.info(f"Planner: {plan}")
-
-        while self._should_continue(iterations, time_elapsed):
-            tmp_planner_history = [plan]
-            api_selector_history: List[Tuple[str, str, str]] = []
-            api_selector_background = self._get_api_selector_background(planner_history)
-            api_plan = self.api_selector.run(plan=plan, background=api_selector_background)
-
-            finished = re.match(r"No API call needed.(.*)", api_plan)
-            if not finished:
-                executor = Caller(llm=self.llm, api_spec=self.api_spec, scenario=self.scenario,
-                                  simple_parser=self.simple_parser, requests_wrapper=self.requests_wrapper)
-                execution_res = executor.run(api_plan=api_plan, background=api_selector_background)
-            else:
-                execution_res = finished.group(1)
-
-            planner_history.append((plan, execution_res))
-            api_selector_history.append((plan, api_plan, execution_res))
+        # Determine the type of task based on the query content
+        if query.startswith("summarize:"):
+            text = query[len("summarize:"):].strip()
+            result = await self.huggingface_service.summarize_text(text)
+            return {"result": result}
+        elif query.startswith("sentiment:"):
+            text = query[len("sentiment:"):].strip()
+            result = await self.huggingface_service.analyze_sentiment(text)
+            return {"result": result}
+        elif query.startswith("generate:"):
+            prompt = query[len("generate:"):].strip()
+            result = await self.huggingface_service.generate_text(prompt)
+            return {"result": result}
+        elif query.startswith("answer:"):
+            parts = query[len("answer:"):].split("|")
+            if len(parts) != 2:
+                raise ValueError("For answering questions, provide input in the format 'answer: question | context'")
+            question, context = parts[0].strip(), parts[1].strip()
+            result = await self.huggingface_service.answer_question(question, context)
+            return {"result": result}
+        else:
+            planner_history: List[Tuple[str, str]] = []
+            iterations = 0
+            time_elapsed = 0.0
+            start_time = time.time()
 
             plan = self.planner.run(input=query, history=planner_history)
             logger.info(f"Planner: {plan}")
 
-            while self._should_continue_plan(plan):
+            while self._should_continue(iterations, time_elapsed):
+                tmp_planner_history = [plan]
+                api_selector_history: List[Tuple[str, str, str]] = []
                 api_selector_background = self._get_api_selector_background(planner_history)
-                api_plan = self.api_selector.run(plan=tmp_planner_history[0], background=api_selector_background,
-                                                 history=api_selector_history, instruction=plan)
+                api_plan = self.api_selector.run(plan=plan, background=api_selector_background)
 
                 finished = re.match(r"No API call needed.(.*)", api_plan)
                 if not finished:
@@ -181,10 +184,29 @@ class ApiLLM(Chain):
                 plan = self.planner.run(input=query, history=planner_history)
                 logger.info(f"Planner: {plan}")
 
-            if self._should_end(plan):
-                break
+                while self._should_continue_plan(plan):
+                    api_selector_background = self._get_api_selector_background(planner_history)
+                    api_plan = self.api_selector.run(plan=tmp_planner_history[0], background=api_selector_background,
+                                                     history=api_selector_history, instruction=plan)
 
-            iterations += 1
-            time_elapsed = time.time() - start_time
+                    finished = re.match(r"No API call needed.(.*)", api_plan)
+                    if not finished:
+                        executor = Caller(llm=self.llm, api_spec=self.api_spec, scenario=self.scenario,
+                                          simple_parser=self.simple_parser, requests_wrapper=self.requests_wrapper)
+                        execution_res = executor.run(api_plan=api_plan, background=api_selector_background)
+                    else:
+                        execution_res = finished.group(1)
 
-        return {"result": plan}
+                    planner_history.append((plan, execution_res))
+                    api_selector_history.append((plan, api_plan, execution_res))
+
+                    plan = self.planner.run(input=query, history=planner_history)
+                    logger.info(f"Planner: {plan}")
+
+                if self._should_end(plan):
+                    break
+
+                iterations += 1
+                time_elapsed = time.time() - start_time
+
+            return {"result": plan}
